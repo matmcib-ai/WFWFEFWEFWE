@@ -1,0 +1,931 @@
+```lua
+-- Standalone client-side loader.
+-- Keeps an ENTIRE plot only when a brainrot in that plot generates $1M/s or more.
+-- Brainrot models are now protected from visual cleanup/deletion.
+
+local Workspace = game:GetService("Workspace")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Lighting = game:GetService("Lighting")
+local SoundService = game:GetService("SoundService")
+local CollectionService = game:GetService("CollectionService")
+
+local THRESHOLD = 1_000_000
+local SCAN_TIMEOUT = 5
+
+if _G.Rose20MLoaderStop then
+    _G.Rose20MLoaderStop()
+end
+
+local running, connections = true, {}
+local retained = {}
+
+local floorNames = {
+    Ground = true,
+    Ground_Left = true,
+    Ground_Right = true,
+    Floor = true,
+    Baseplate = true,
+}
+
+local gameplayRoots = {
+    Interacts = true,
+    ToolsAdds = true,
+    __PROJECTILES = true,
+    Events = true,
+    Debris = true,
+}
+
+-- ============================================================
+-- BRAINROT PROTECTION
+-- ============================================================
+
+local function isBrainrotVisual(object)
+    if not object then
+        return false
+    end
+
+    return CollectionService:HasTag(object, "ClientRenderBrainrot")
+        or CollectionService:HasTag(object, "RenderedMovingAnimal")
+        or CollectionService:HasTag(object, "Animal")
+end
+
+-- Checks the object itself AND its ancestors.
+-- This prevents a brainrot from being destroyed when one of its
+-- parent containers is being cleaned.
+local function belongsToBrainrot(object)
+    if not object then
+        return false
+    end
+
+    local current = object
+
+    while current and current ~= Workspace do
+        if isBrainrotVisual(current) then
+            return true
+        end
+
+        current = current.Parent
+    end
+
+    return false
+end
+
+-- ============================================================
+-- SAFE DELETE
+-- ============================================================
+
+local function delete(object)
+    if not (object and object.Parent) then
+        return
+    end
+
+    -- NEVER delete a brainrot or anything belonging to one.
+    if belongsToBrainrot(object) then
+        return
+    end
+
+    -- Keep sounds alive.
+    if object:IsA("Sound") then
+        pcall(function()
+            object.Parent = SoundService
+        end)
+        return
+    end
+
+    for _, descendant in ipairs(object:GetDescendants()) do
+        if descendant:IsA("Sound") then
+            pcall(function()
+                descendant.Parent = SoundService
+            end)
+        end
+    end
+
+    pcall(function()
+        object:Destroy()
+    end)
+end
+
+-- ============================================================
+-- MAP CLEANUP
+-- ============================================================
+
+local function cleanMapChild(child)
+
+    -- NEVER clean a brainrot.
+    if belongsToBrainrot(child) then
+        return
+    end
+
+    if floorNames[child.Name]
+        or gameplayRoots[child.Name]
+        or child.Name == "RenderedMovingAnimals"
+        or child:IsA("Sound") then
+        return
+    end
+
+    if child:IsA("Model")
+        and (child.Name:match("_Clone$")
+        or child:FindFirstChildOfClass("Humanoid")) then
+        return
+    end
+
+    delete(child)
+end
+
+local function smoothVisiblePart(object)
+    -- Never modify brainrot visuals.
+    if belongsToBrainrot(object) then
+        return
+    end
+
+    if not object:IsA("BasePart") then
+        return
+    end
+
+    pcall(function()
+        object.TopSurface = Enum.SurfaceType.Smooth
+        object.BottomSurface = Enum.SurfaceType.Smooth
+        object.LeftSurface = Enum.SurfaceType.Smooth
+        object.RightSurface = Enum.SurfaceType.Smooth
+        object.FrontSurface = Enum.SurfaceType.Smooth
+        object.BackSurface = Enum.SurfaceType.Smooth
+        object.Material = Enum.Material.SmoothPlastic
+        object.MaterialVariant = ""
+    end)
+end
+
+local function smoothFloorQuick(root)
+    if belongsToBrainrot(root) then
+        return
+    end
+
+    smoothVisiblePart(root)
+
+    for _, object in ipairs(root:GetDescendants()) do
+        if not belongsToBrainrot(object) then
+            smoothVisiblePart(object)
+        end
+    end
+end
+
+local watchedMaps = setmetatable({}, {__mode = "k"})
+
+local function watchMap(map)
+    if watchedMaps[map] then
+        return
+    end
+
+    watchedMaps[map] = true
+
+    for _, child in ipairs(map:GetChildren()) do
+        if floorNames[child.Name] then
+            task.defer(smoothFloorQuick, child)
+        else
+            cleanMapChild(child)
+        end
+    end
+
+    connections[#connections + 1] =
+        map.ChildAdded:Connect(function(child)
+            if not running then
+                return
+            end
+
+            if belongsToBrainrot(child) then
+                return
+            end
+
+            if floorNames[child.Name] then
+                task.defer(smoothFloorQuick, child)
+            else
+                cleanMapChild(child)
+            end
+        end)
+end
+
+-- ============================================================
+-- ROOT PROTECTION
+-- ============================================================
+
+local function keepRoot(object)
+
+    -- Brainrots are always protected.
+    if belongsToBrainrot(object) then
+        return true
+    end
+
+    if object.Name == "Plots"
+        or object.Name == "Map"
+        or gameplayRoots[object.Name]
+        or object:IsA("Camera")
+        or object.Name == "RenderedMovingAnimals"
+        or object:IsA("Terrain")
+        or object:IsA("Sound")
+        or floorNames[object.Name] then
+        return true
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Character == object then
+            return true
+        end
+    end
+
+    if object:IsA("Model")
+        and (object.Name:match("_Clone$")
+        or object:FindFirstChildOfClass("Humanoid")) then
+        return true
+    end
+
+    return false
+end
+
+-- ============================================================
+-- INITIAL CLEANUP
+-- ============================================================
+
+for _, object in ipairs(Workspace:GetChildren()) do
+
+    if object.Name == "Map" then
+        watchMap(object)
+
+    elseif floorNames[object.Name] then
+        task.defer(smoothFloorQuick, object)
+
+    elseif not keepRoot(object) then
+        delete(object)
+    end
+end
+
+connections[#connections + 1] =
+    Workspace.ChildAdded:Connect(function(object)
+
+        if not running then
+            return
+        end
+
+        task.defer(function()
+
+            if not running or not object.Parent then
+                return
+            end
+
+            if belongsToBrainrot(object) then
+                return
+            end
+
+            if object.Name == "Map" then
+                watchMap(object)
+
+            elseif floorNames[object.Name] then
+                task.defer(smoothFloorQuick, object)
+
+            elseif not keepRoot(object) then
+                delete(object)
+            end
+        end)
+    end)
+
+-- ============================================================
+-- PLOTS
+-- ============================================================
+
+local plots = Workspace:WaitForChild("Plots", 90)
+
+if not plots then
+    warn("[20M Loader] No aparecieron Plots.")
+    return
+end
+
+task.defer(function()
+
+    for _, plot in ipairs(plots:GetChildren()) do
+
+        local podiums = plot:FindFirstChild("AnimalPodiums")
+
+        for i, part in ipairs(plot:GetDescendants()) do
+
+            -- Do not modify brainrot visuals.
+            if not belongsToBrainrot(part) then
+
+                if not (podiums and part:IsDescendantOf(podiums)) then
+                    smoothVisiblePart(part)
+                end
+            end
+
+            if i % 400 == 0 then
+                task.wait()
+            end
+        end
+    end
+end)
+
+-- ============================================================
+-- DATA
+-- ============================================================
+
+local datas = ReplicatedStorage:WaitForChild("Datas", 90)
+
+assert(
+    datas,
+    "[20M Loader] No se encontraron los datos de brainrots."
+)
+
+local okAnimals, animalsData =
+    pcall(require, datas:WaitForChild("Animals", 90))
+
+local okMutations, mutations =
+    pcall(require, datas:WaitForChild("Mutations", 90))
+
+local okTraits, traitsData =
+    pcall(require, datas:WaitForChild("Traits", 90))
+
+local okGame, gameData =
+    pcall(require, datas:WaitForChild("Game", 90))
+
+assert(
+    okAnimals
+        and type(animalsData) == "table"
+        and okMutations
+        and okTraits
+        and okGame,
+    "[20M Loader] No se pudieron cargar los datos de generación."
+)
+
+local function generation(index, mutation, traits)
+
+    local animal = animalsData[index]
+
+    if not animal then
+        return nil
+    end
+
+    local base = animal.Generation
+
+    if not base then
+
+        local modifier =
+            gameData.Game
+            and gameData.Game.AnimalGanerationModifier
+
+        if type(modifier) ~= "number" then
+            return nil
+        end
+
+        base = (animal.Price or 0) * modifier
+    end
+
+    local mult = 1
+
+    local mutationData =
+        mutation and mutations[mutation]
+
+    if mutationData then
+        mult = mult + (mutationData.Modifier or 0)
+    end
+
+    local sleepy = false
+
+    for _, trait in pairs(traits or {}) do
+
+        if trait == "Sleepy" then
+            sleepy = true
+
+        else
+
+            local traitData = traitsData[trait]
+
+            if traitData then
+                mult =
+                    mult
+                    + (traitData.MultiplierModifier or 0)
+            end
+        end
+    end
+
+    local result = base * mult
+
+    if sleepy then
+        result = result * 0.5
+    end
+
+    return math.round(result)
+end
+
+-- ============================================================
+-- SYNCHRONIZER
+-- ============================================================
+
+local packages =
+    ReplicatedStorage:WaitForChild("Packages", 90)
+
+local syncFolder =
+    packages and packages:WaitForChild("Synchronizer", 90)
+
+local requestData =
+    syncFolder and syncFolder:WaitForChild("RequestData", 90)
+
+assert(
+    requestData and requestData:IsA("RemoteFunction"),
+    "[20M Loader] No se encontró RequestData del synchronizer."
+)
+
+local function findMyPlot()
+
+    for _, plot in ipairs(plots:GetChildren()) do
+
+        local sign =
+            plot:FindFirstChild("PlotSign")
+
+        if sign then
+
+            local marker =
+                sign:FindFirstChild("YourBase")
+
+            if marker
+                and marker:IsA("BillboardGui")
+                and marker.Enabled then
+
+                return plot
+            end
+
+            local surfaceGui =
+                sign:FindFirstChildWhichIsA(
+                    "SurfaceGui",
+                    true
+                )
+
+            local label =
+                surfaceGui
+                and surfaceGui:FindFirstChildWhichIsA(
+                    "TextLabel",
+                    true
+                )
+
+            if label then
+
+                local text =
+                    label.Text:lower()
+
+                if text:find(
+                    LocalPlayer.Name:lower(),
+                    1,
+                    true
+                )
+                or text:find(
+                    LocalPlayer.DisplayName:lower(),
+                    1,
+                    true
+                ) then
+
+                    return plot
+                end
+            end
+        end
+    end
+end
+
+_G.Rose20MLoaderStop = function()
+
+    running = false
+
+    for _, connection in ipairs(connections) do
+        connection:Disconnect()
+    end
+end
+
+local function readPlot(plot)
+
+    local instanceCache
+
+    if type(_G.JAF_InstanceChans) == "function" then
+
+        local ok, channels =
+            pcall(_G.JAF_InstanceChans)
+
+        local channel =
+            ok
+            and type(channels) == "table"
+            and channels[plot.Name]
+
+        if channel then
+            instanceCache =
+                rawget(channel, "CacheTable")
+        end
+    end
+
+    local ok, result =
+        pcall(function()
+            return requestData:InvokeServer(plot.Name)
+        end)
+
+    local cache =
+        ok
+        and type(result) == "table"
+        and result
+        or instanceCache
+
+    if type(cache) ~= "table" then
+        return nil
+    end
+
+    local animals =
+        cache.AnimalList
+        or cache.Animals
+
+    if type(animals) ~= "table" then
+
+        if cache.Owner == nil
+            and next(cache) ~= nil then
+
+            animals = {}
+
+        else
+            return nil
+        end
+    end
+
+    local keepSlots = {}
+
+    local function checkAnimals(list)
+
+        if type(list) ~= "table" then
+            return true
+        end
+
+        for slot, animal in pairs(list) do
+
+            if type(animal) == "table"
+                and animal.Index then
+
+                local amount =
+                    generation(
+                        animal.Index,
+                        animal.Mutation,
+                        animal.Traits
+                    )
+
+                if type(amount) ~= "number" then
+                    return false
+                end
+
+                if amount >= THRESHOLD then
+                    keepSlots[tostring(slot)] = true
+                end
+            end
+        end
+
+        return true
+    end
+
+    if not checkAnimals(animals)
+        or not checkAnimals(
+            type(instanceCache) == "table"
+            and (
+                instanceCache.AnimalList
+                or instanceCache.Animals
+            )
+        ) then
+
+        return nil
+    end
+
+    return
+        keepSlots,
+        cache.Owner
+        or (
+            instanceCache
+            and instanceCache.Owner
+        )
+end
+
+-- ============================================================
+-- SCAN
+-- ============================================================
+
+local deadline =
+    os.clock() + SCAN_TIMEOUT
+
+local snapshot, myPlotName =
+    nil, nil
+
+repeat
+
+    local current = {}
+    local complete = true
+
+    myPlotName =
+        (findMyPlot() or {}).Name
+
+    local list =
+        plots:GetChildren()
+
+    if #list == 0 then
+        complete = false
+    end
+
+    local remaining = #list
+
+    for _, plot in ipairs(list) do
+
+        task.spawn(function()
+
+            local slots, owner =
+                readPlot(plot)
+
+            if not slots then
+
+                complete = false
+
+            else
+
+                current[plot.Name] =
+                    slots
+
+                if not myPlotName
+                    and owner ~= nil then
+
+                    if owner == LocalPlayer
+                        or owner == LocalPlayer.Name
+                        or owner == LocalPlayer.UserId
+                        or type(owner) == "table"
+                        and (
+                            owner.UserId
+                                == LocalPlayer.UserId
+                            or owner.Name
+                                == LocalPlayer.Name
+                        ) then
+
+                        myPlotName =
+                            plot.Name
+                    end
+                end
+            end
+
+            remaining -= 1
+        end)
+    end
+
+    while remaining > 0
+        and running
+        and os.clock() < deadline do
+
+        task.wait(0.03)
+    end
+
+    if remaining > 0 then
+        complete = false
+    end
+
+    if complete and myPlotName then
+
+        snapshot = current
+        break
+    end
+
+    task.wait(0.1)
+
+until not running
+    or os.clock() > deadline
+
+if not myPlotName then
+
+    warn(
+        "[20M Loader] No se detectó tu base. Cancelando para evitar borrar todo."
+    )
+
+    return
+end
+
+retained = snapshot or {}
+
+print(
+    "[20M Loader] Scanner completo; comenzando limpieza de plots."
+)
+
+local keptCount, removedCount =
+    0, 0
+
+for _, plot in ipairs(plots:GetChildren()) do
+
+    if not running then
+        return
+    end
+
+    if plot.Name == myPlotName
+        or next(retained[plot.Name] or {}) then
+
+        keptCount += 1
+
+    else
+
+        -- Before deleting a plot, protected brainrots inside it
+        -- are left untouched by the safe delete function.
+        delete(plot)
+
+        removedCount += 1
+    end
+end
+
+-- ============================================================
+-- SMOOTHING
+-- ============================================================
+
+local function smooth(object)
+
+    -- Never alter brainrot visuals.
+    if belongsToBrainrot(object) then
+        return
+    end
+
+    if object:IsA("BasePart") then
+
+        smoothVisiblePart(object)
+
+        pcall(function()
+            if object:IsA("MeshPart") then
+                object.TextureID = ""
+            end
+        end)
+
+    elseif object:IsA("Decal")
+        or object:IsA("Texture")
+        or object:IsA("SurfaceAppearance") then
+
+        delete(object)
+
+    elseif object:IsA("SpecialMesh") then
+
+        pcall(function()
+            object.TextureId = ""
+        end)
+    end
+end
+
+local function smoothTree(root, plot)
+
+    if not root then
+        return
+    end
+
+    -- Do not process a brainrot tree.
+    if belongsToBrainrot(root) then
+        return
+    end
+
+    local podiums =
+        plot
+        and plot:FindFirstChild("AnimalPodiums")
+
+    smooth(root)
+
+    for i, object in ipairs(root:GetDescendants()) do
+
+        if not belongsToBrainrot(object) then
+
+            local protectedVisual = false
+            local visual = object
+
+            while visual
+                and visual ~= plot
+                and visual ~= root do
+
+                if isBrainrotVisual(visual) then
+                    protectedVisual = true
+                    break
+                end
+
+                visual = visual.Parent
+            end
+
+            if not protectedVisual
+                and not (
+                    podiums
+                    and object:IsDescendantOf(podiums)
+                ) then
+
+                smooth(object)
+            end
+        end
+
+        if i % 350 == 0 then
+            RunService.Heartbeat:Wait()
+        end
+    end
+end
+
+-- ============================================================
+-- MAP
+-- ============================================================
+
+local map =
+    Workspace:FindFirstChild("Map")
+
+if map then
+
+    for _, child in ipairs(map:GetChildren()) do
+
+        if floorNames[child.Name] then
+            smoothTree(child)
+        end
+    end
+end
+
+for _, child in ipairs(Workspace:GetChildren()) do
+
+    if floorNames[child.Name] then
+        smoothTree(child)
+    end
+end
+
+for _, plot in ipairs(plots:GetChildren()) do
+    smoothTree(plot, plot)
+end
+
+connections[#connections + 1] =
+    Workspace.DescendantAdded:Connect(function(object)
+
+        if not running then
+            return
+        end
+
+        -- Never process newly-created brainrots.
+        if belongsToBrainrot(object) then
+            return
+        end
+
+        local plotAncestor = object
+
+        while plotAncestor
+            and plotAncestor.Parent ~= plots do
+
+            plotAncestor =
+                plotAncestor.Parent
+        end
+
+        local isPlotBase =
+            plotAncestor
+            and plotAncestor.Parent == plots
+            and not object:FindFirstAncestor(
+                "AnimalPodiums"
+            )
+
+        local insideFloor = false
+        local ancestor = object
+
+        while ancestor
+            and ancestor ~= Workspace do
+
+            if floorNames[ancestor.Name] then
+                insideFloor = true
+                break
+            end
+
+            ancestor = ancestor.Parent
+        end
+
+        if isPlotBase or insideFloor then
+            smooth(object)
+        end
+    end)
+
+-- ============================================================
+-- LIGHTING
+-- ============================================================
+
+for _, effect in ipairs(Lighting:GetChildren()) do
+
+    if effect:IsA("PostEffect")
+        or effect:IsA("Atmosphere")
+        or effect:IsA("Sky")
+        or effect:IsA("Clouds") then
+
+        delete(effect)
+    end
+end
+
+pcall(function()
+
+    Lighting.GlobalShadows = false
+    Lighting.FogEnd = 1e9
+    Lighting.EnvironmentDiffuseScale = 0
+    Lighting.EnvironmentSpecularScale = 0
+
+    settings().Rendering.QualityLevel =
+        Enum.QualityLevel.Level01
+end)
+
+print(
+    "[20M Loader] Mapa limpiado con piso conservado. Plots conservados:",
+    keptCount,
+    "| Plots borrados:",
+    removedCount
+)
+```
+
+
+print("[20M Loader] Mapa limpiado con piso conservado. Plots conservados:", keptCount,
+    "| Plots borrados:", removedCount)
